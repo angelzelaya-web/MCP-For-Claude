@@ -6,15 +6,15 @@ import { z } from "zod";
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
+// ─── Command Queue ───────────────────────────
 let commandQueue = [];
 let commandIdCounter = 0;
 
 function enqueueCommand(tool, args) {
   const id = ++commandIdCounter;
-  const cmd = { id, tool, args, status: "pending", result: null };
-  commandQueue.push(cmd);
+  commandQueue.push({ id, tool, args, status: "pending", result: null });
   return id;
 }
 
@@ -32,12 +32,13 @@ function waitForResult(id, timeoutMs = 30000) {
       if (Date.now() - start > timeoutMs) {
         clearInterval(interval);
         commandQueue = commandQueue.filter((c) => c.id !== id);
-        reject(new Error("Timeout - Is Roblox Studio plugin running?"));
+        reject(new Error("Timeout - Is the Roblox Studio plugin running?"));
       }
     }, 200);
   });
 }
 
+// ─── Studio Plugin Endpoints ─────────────────
 app.get("/studio/poll", (req, res) => {
   const pending = commandQueue.filter((c) => c.status === "pending");
   pending.forEach((c) => (c.status = "sent"));
@@ -55,9 +56,10 @@ app.post("/studio/result", (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.json({ status: "🟢 Roblox MCP Server running" });
+  res.json({ status: "🟢 Roblox MCP Server running", queue: commandQueue.length });
 });
 
+// ─── MCP Server ──────────────────────────────
 const mcpServer = new McpServer({ name: "roblox-studio", version: "1.0.0" });
 
 async function studioCall(tool, args) {
@@ -67,7 +69,7 @@ async function studioCall(tool, args) {
   return result;
 }
 
-mcpServer.tool("run_script", "Execute Lua in Roblox Studio.",
+mcpServer.tool("run_script", "Execute Lua code in Roblox Studio.",
   { code: z.string(), context: z.enum(["Server", "Client", "Plugin"]).default("Plugin") },
   async ({ code, context }) => {
     const result = await studioCall("run_script", { code, context });
@@ -83,7 +85,7 @@ mcpServer.tool("insert_instance", "Insert a new Instance into Roblox Studio.",
   }
 );
 
-mcpServer.tool("edit_script", "Edit a script's source code.",
+mcpServer.tool("edit_script", "Edit a script's source code in Studio.",
   { path: z.string(), source: z.string() },
   async (args) => {
     const result = await studioCall("edit_script", args);
@@ -91,7 +93,7 @@ mcpServer.tool("edit_script", "Edit a script's source code.",
   }
 );
 
-mcpServer.tool("get_script", "Read a script's source code.",
+mcpServer.tool("get_script", "Read a script's source code from Studio.",
   { path: z.string() },
   async ({ path }) => {
     const result = await studioCall("get_script", { path });
@@ -99,7 +101,7 @@ mcpServer.tool("get_script", "Read a script's source code.",
   }
 );
 
-mcpServer.tool("set_property", "Set a property on any instance.",
+mcpServer.tool("set_property", "Set a property on any instance in Studio.",
   { path: z.string(), property: z.string(), value: z.any() },
   async (args) => {
     const result = await studioCall("set_property", args);
@@ -107,7 +109,7 @@ mcpServer.tool("set_property", "Set a property on any instance.",
   }
 );
 
-mcpServer.tool("list_children", "List children of an instance.",
+mcpServer.tool("list_children", "List children of an instance in Studio.",
   { path: z.string().default("game") },
   async ({ path }) => {
     const result = await studioCall("list_children", { path });
@@ -115,7 +117,7 @@ mcpServer.tool("list_children", "List children of an instance.",
   }
 );
 
-mcpServer.tool("delete_instance", "Delete an instance.",
+mcpServer.tool("delete_instance", "Delete an instance from Studio.",
   { path: z.string() },
   async ({ path }) => {
     const result = await studioCall("delete_instance", { path });
@@ -123,7 +125,7 @@ mcpServer.tool("delete_instance", "Delete an instance.",
   }
 );
 
-mcpServer.tool("move_instance", "Move/reparent an instance.",
+mcpServer.tool("move_instance", "Move/reparent an instance in Studio.",
   { path: z.string(), newParent: z.string() },
   async (args) => {
     const result = await studioCall("move_instance", args);
@@ -131,22 +133,45 @@ mcpServer.tool("move_instance", "Move/reparent an instance.",
   }
 );
 
+// ─── SSE Transport ───────────────────────────
 const transports = {};
 
 app.get("/sse", async (req, res) => {
-  console.log("🔌 Claude connected via SSE");
-  const transport = new SSEServerTransport("/messages", res);
-  transports[transport.sessionId] = transport;
-  res.on("close", () => { delete transports[transport.sessionId]; });
-  await mcpServer.connect(transport);
+  console.log("🔌 Claude connecting via SSE...");
+  try {
+    const transport = new SSEServerTransport("/messages", res);
+    transports[transport.sessionId] = transport;
+    res.on("close", () => {
+      console.log("🔌 Claude disconnected:", transport.sessionId);
+      delete transports[transport.sessionId];
+    });
+    await mcpServer.connect(transport);
+    console.log("✅ Claude connected:", transport.sessionId);
+  } catch (err) {
+    console.error("SSE error:", err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
-  if (!transport) { res.status(404).json({ error: "Session not found" }); return; }
-  await transport.handlePostMessage(req, res);
+  if (!transport) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+  try {
+    await transport.handlePostMessage(req, res);
+  } catch (err) {
+    console.error("Message error:", err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
 });
 
+// ─── Start ───────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Roblox MCP Server running on port ${PORT}`);
+  console.log(`   SSE endpoint: /sse`);
+  console.log(`   Studio poll:  /studio/poll`);
+});
